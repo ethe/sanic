@@ -10,3 +10,4 @@ tox
 ujson
 uvloop
 gunicorn
+graphene
