@@ -20,7 +20,6 @@ from sanic.router import Router
 from sanic.server import serve, serve_multiple, HttpProtocol, Signal
 from sanic.static import register as static_register
 from sanic.testing import SanicTestClient
-from sanic.views import CompositionView
 from sanic.websocket import WebSocketProtocol, ConnectionClosed
 
 
@@ -28,7 +27,7 @@ class Sanic:
 
     def __init__(self, name=None, router=None, error_handler=None,
                  load_env=True, request_class=None,
-                 log_config=LOGGING):
+                 log_config=LOGGING, websocket_enabled=False):
         if log_config:
             logging.config.dictConfig(log_config)
         # Only set up a default log handler if the
@@ -60,7 +59,7 @@ class Sanic:
         self.sock = None
         self.listeners = defaultdict(list)
         self.is_running = False
-        self.websocket_enabled = False
+        self.websocket_enabled = websocket_enabled
         self.websocket_tasks = []
 
         # Register alternative method names
@@ -109,8 +108,7 @@ class Sanic:
         return decorator
 
     # Decorator
-    def route(self, uri, methods=frozenset({'GET'}), host=None,
-              strict_slashes=False):
+    def route(self, uri, host=None, strict_slashes=False, args=[], kwargs={}):
         """Decorate a function to be registered as a route
 
         :param uri: path of the URL
@@ -124,73 +122,25 @@ class Sanic:
         if not uri.startswith('/'):
             uri = '/' + uri
 
-        def response(handler):
-            self.router.add(uri=uri, methods=methods, handler=handler,
-                            host=host, strict_slashes=strict_slashes)
-            return handler
+        if not self.websocket_enabled:
+            def response(handler_class):
+                methods = set()
+                handler = handler_class(*args, **kwargs)
+
+                for method in HTTP_METHODS:
+                    if getattr(handler, method.lower(), None):
+                        methods.add(method)
+
+                self.router.add(uri=uri, methods=methods, handler=handler,
+                                host=host, strict_slashes=strict_slashes)
+                return handler
+        else:
+            response = self.websocket(uri, host=host, strict_slashes=strict_slashes)
 
         return response
 
-    # Shorthand method decorators
-    def get(self, uri, host=None, strict_slashes=False):
-        return self.route(uri, methods=frozenset({"GET"}), host=host,
-                          strict_slashes=strict_slashes)
-
-    def post(self, uri, host=None, strict_slashes=False):
-        return self.route(uri, methods=frozenset({"POST"}), host=host,
-                          strict_slashes=strict_slashes)
-
-    def put(self, uri, host=None, strict_slashes=False):
-        return self.route(uri, methods=frozenset({"PUT"}), host=host,
-                          strict_slashes=strict_slashes)
-
-    def head(self, uri, host=None, strict_slashes=False):
-        return self.route(uri, methods=frozenset({"HEAD"}), host=host,
-                          strict_slashes=strict_slashes)
-
-    def options(self, uri, host=None, strict_slashes=False):
-        return self.route(uri, methods=frozenset({"OPTIONS"}), host=host,
-                          strict_slashes=strict_slashes)
-
-    def patch(self, uri, host=None, strict_slashes=False):
-        return self.route(uri, methods=frozenset({"PATCH"}), host=host,
-                          strict_slashes=strict_slashes)
-
-    def delete(self, uri, host=None, strict_slashes=False):
-        return self.route(uri, methods=frozenset({"DELETE"}), host=host,
-                          strict_slashes=strict_slashes)
-
-    def add_route(self, handler, uri, methods=frozenset({'GET'}), host=None,
-                  strict_slashes=False):
-        """A helper method to register class instance or
-        functions as a handler to the application url
-        routes.
-
-        :param handler: function or class instance
-        :param uri: path of the URL
-        :param methods: list or tuple of methods allowed, these are overridden
-                        if using a HTTPMethodView
-        :param host:
-        :return: function or class instance
-        """
-        # Handle HTTPMethodView differently
-        if hasattr(handler, 'view_class'):
-            methods = set()
-
-            for method in HTTP_METHODS:
-                if getattr(handler.view_class, method.lower(), None):
-                    methods.add(method)
-
-        # handle composition view differently
-        if isinstance(handler, CompositionView):
-            methods = handler.handlers.keys()
-
-        self.route(uri=uri, methods=methods, host=host,
-                   strict_slashes=strict_slashes)(handler)
-        return handler
-
     # Decorator
-    def websocket(self, uri, host=None, strict_slashes=False):
+    def websocket(self, uri, host=None, strict_slashes=False, args=[], kwargs={}):
         """Decorate a function to be registered as a websocket route
         :param uri: path of the URL
         :param host:
@@ -203,7 +153,9 @@ class Sanic:
         if not uri.startswith('/'):
             uri = '/' + uri
 
-        def response(handler):
+        def response(handler_class):
+            handler = handler_class(*args, **kwargs)
+
             async def websocket_handler(request, *args, **kwargs):
                 request.app = self
                 try:
@@ -239,21 +191,18 @@ class Sanic:
         return self.websocket(uri, host=host,
                               strict_slashes=strict_slashes)(handler)
 
-    def enable_websocket(self, enable=True):
+    def enable_websocket(self):
         """Enable or disable the support for websocket.
 
         Websocket is enabled automatically if websocket routes are
         added to the application.
         """
-        if not self.websocket_enabled:
-            # if the server is stopped, we want to cancel any ongoing
-            # websocket tasks, to allow the server to exit promptly
-            @self.listener('before_server_stop')
-            def cancel_websocket_tasks(app, loop):
-                for task in self.websocket_tasks:
-                    task.cancel()
-
-        self.websocket_enabled = enable
+        # if the server is stopped, we want to cancel any ongoing
+        # websocket tasks, to allow the server to exit promptly
+        @self.listener('before_server_stop')
+        def cancel_websocket_tasks(app, loop):
+            for task in self.websocket_tasks:
+                task.cancel()
 
     def remove_route(self, uri, clean_cache=True, host=None):
         self.router.remove(uri, clean_cache, host)
@@ -361,8 +310,8 @@ class Sanic:
 
         if not uri or not route:
             raise URLBuildError(
-                    'Endpoint with name `{}` was not found'.format(
-                        view_name))
+                'Endpoint with name `{}` was not found'.format(
+                    view_name))
 
         if uri != '/' and uri.endswith('/'):
             uri = uri[:-1]
